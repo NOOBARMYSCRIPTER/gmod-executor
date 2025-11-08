@@ -12,6 +12,11 @@
 #include "../globals.hpp"
 
 #include <d3d9.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <chrono>
+#include <filesystem>
 #pragma comment(lib, "d3d9.lib")
 
 typedef HRESULT(APIENTRY* PresentFn)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
@@ -27,6 +32,39 @@ namespace OverlayHook
 	inline bool first_call = true;
 	inline ImGui::FileBrowser fileDialog;
 	inline TextEditor editor;
+
+	// --- Auto-execute variables ---
+	inline std::thread autoExecThread;
+	inline std::atomic<bool> autoExecRunning{ false };
+	inline std::mutex autoExecMutex;
+	inline std::string autoExecScriptPath;
+	inline std::string autoExecScriptContent;
+	inline int autoExecIntervalSec = 5;
+	// --------------------------------
+
+	static void AutoExecLoop()
+	{
+		while (autoExecRunning.load())
+		{
+			{
+				std::lock_guard<std::mutex> lk(autoExecMutex);
+				if (!autoExecScriptContent.empty())
+				{
+					executor.scriptQueue.push(autoExecScriptContent);
+					logs->println("Auto-execute: queued script from %s", autoExecScriptPath.empty() ? "<memory>" : autoExecScriptPath.c_str());
+				}
+			}
+
+			int total_ms = autoExecIntervalSec * 1000;
+			int slept = 0;
+			const int step = 100;
+			while (autoExecRunning.load() && slept < total_ms)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(step));
+				slept += step;
+			}
+		}
+	}
 
 	HRESULT APIENTRY hookedPresent(IDirect3DDevice9* device, const RECT* src_rect, const RECT* dest_rect, HWND dest_window_override, const RGNDATA* dirty_region)
 	{
@@ -58,13 +96,13 @@ namespace OverlayHook
 
 			if (ImGui::BeginTabItem("File Browser"))
 			{
-				if(ImGui::Button("Open File Browser"))
+				if (ImGui::Button("Open File Browser"))
 					fileDialog.Open();
 
 				ImGui::EndTabItem();
 			}
 
-			if(ImGui::BeginTabItem("Lua Editor"))
+			if (ImGui::BeginTabItem("Lua Editor"))
 			{
 				auto cpos = editor.GetCursorPosition();
 				ImGui::Text("%6d/%-6d %6d lines  | %s | %s | %s", cpos.mLine + 1, cpos.mColumn + 1, editor.GetTotalLines(),
@@ -82,7 +120,72 @@ namespace OverlayHook
 				}
 
 				editor.Render("TextEditor");
-				
+
+				ImGui::EndTabItem();
+			}
+
+			if (ImGui::BeginTabItem("Auto-Execute"))
+			{
+				ImGui::TextWrapped("Select a Lua file and press Start. The selected script will be queued every N seconds.");
+
+				if (ImGui::Button("Select Script File"))
+				{
+					fileDialog.Open();
+				}
+				ImGui::SameLine();
+				if (!autoExecScriptPath.empty())
+				{
+					ImGui::Text("Selected: %s", std::filesystem::path(autoExecScriptPath).filename().string().c_str());
+				}
+				else
+				{
+					ImGui::Text("No script selected");
+				}
+
+				ImGui::SliderInt("Interval (sec)", &autoExecIntervalSec, 1, 60);
+
+				if (!autoExecRunning.load())
+				{
+					if (ImGui::Button("Start Auto-Execute"))
+					{
+						std::lock_guard<std::mutex> lk(autoExecMutex);
+						if (autoExecScriptContent.empty())
+						{
+							logs->println("Auto-execute: no script loaded, cannot start.");
+						}
+						else
+						{
+							autoExecRunning.store(true);
+							autoExecThread = std::thread(AutoExecLoop);
+							logs->println("Auto-execute: started (interval %d sec).", autoExecIntervalSec);
+						}
+					}
+				}
+				else
+				{
+					if (ImGui::Button("Stop Auto-Execute"))
+					{
+						autoExecRunning.store(false);
+						if (autoExecThread.joinable())
+							autoExecThread.join();
+						logs->println("Auto-execute: stopped.");
+					}
+				}
+
+				if (ImGui::Button("Execute Now"))
+				{
+					std::lock_guard<std::mutex> lk(autoExecMutex);
+					if (!autoExecScriptContent.empty())
+					{
+						executor.scriptQueue.push(autoExecScriptContent);
+						logs->println("Auto-execute: queued script (manual).");
+					}
+					else
+					{
+						logs->println("Auto-execute: no script loaded.");
+					}
+				}
+
 				ImGui::EndTabItem();
 			}
 
@@ -99,6 +202,13 @@ namespace OverlayHook
 					std::string script((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 					executor.scriptQueue.push(script);
 					logs->println("Queued script from file: %s", fileDialog.GetSelected().string().c_str());
+
+					// Also set as auto-exec script (overwrite)
+					{
+						std::lock_guard<std::mutex> lk(autoExecMutex);
+						autoExecScriptPath = fileDialog.GetSelected().string();
+						autoExecScriptContent = script;
+					}
 				}
 				else
 				{
@@ -122,7 +232,7 @@ namespace OverlayHook
 		{
 		case WM_KEYDOWN:
 			if (wParam == VK_SUBTRACT)
-				menuOpen ^= 1; // Toggle menu open state with Insert key
+				menuOpen ^= 1; // Toggle menu open state with Subtract key
 			break;
 		}
 
@@ -131,7 +241,6 @@ namespace OverlayHook
 		{
 			ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
 
-			// Check if ImGui wants to capture this kind of input
 			ImGuiIO& io = ImGui::GetIO();
 			bool is_mouse = (uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST);
 			bool is_keyboard = (uMsg >= WM_KEYFIRST && uMsg <= WM_KEYLAST);
@@ -172,10 +281,10 @@ namespace OverlayHook
 
 		logs->println("Found gameoverlayrenderer64.dll at: 0x%p", (HMODULE)mod);
 
-		auto ptr = Memory::PatternScan(static_cast<uintptr_t>(mod), 
+		auto ptr = Memory::PatternScan(static_cast<uintptr_t>(mod),
 			"48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 41 54 41 56 41 57 48 81 EC ? ? ? ? 4C 8B A4 24 ? ? ? ?");
-	
-		if(!ptr)
+
+		if (!ptr)
 		{
 			logs->println("Failed to find pattern in gameoverlayrenderer64.dll.");
 			return false;
@@ -199,6 +308,14 @@ namespace OverlayHook
 
 	bool Cleanup()
 	{
+		if (autoExecRunning.load())
+		{
+			autoExecRunning.store(false);
+			if (autoExecThread.joinable())
+				autoExecThread.join();
+			logs->println("Auto-execute: thread stopped in Cleanup.");
+		}
+
 		if (hook)
 		{
 			hook->unhook();
@@ -212,7 +329,7 @@ namespace OverlayHook
 			SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, (LONG_PTR)originalWndProc);
 			logs->println("Restored original WndProc.");
 		}
-		
+
 		logs->println("OverlayHook cleanup complete.");
 		return true;
 	}
