@@ -121,7 +121,7 @@ namespace OverlayHook
 		switch (uMsg)
 		{
 		case WM_KEYDOWN:
-			if (wParam == VK_INSERT)
+			if (wParam == VK_SUBTRACT)
 				menuOpen ^= 1; // Toggle menu open state with Insert key
 			break;
 		}
@@ -216,4 +216,5 @@ namespace OverlayHook
 		logs->println("OverlayHook cleanup complete.");
 		return true;
 	}
+
 }
